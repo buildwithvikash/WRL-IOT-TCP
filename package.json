@@ -1,0 +1,12 @@
+{
+  "name": "wrl-iot-tcp",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node tcpServer.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "mongoose": "^8.9.0"
+  }
+}
