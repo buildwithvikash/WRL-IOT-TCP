@@ -63,7 +63,7 @@ const server = net.createServer((socket) => {
 
     const frame = buildModbusFrame(
       2,        // Slave ID
-      0x04,     // ✅ Read Input Registers
+      0x03,     // ✅ Read Input Registers
       activePoll.addr - 1,
       2          // 2 registers = 1 float
     );
