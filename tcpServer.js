@@ -49,7 +49,7 @@ const polls = [
     slave: 2,
     func: 0x03,
     start: 30001,
-    qty: 28,
+    qty: 28, // 14 registers = 7 floats
   },
 ];
 
@@ -60,9 +60,13 @@ const server = net.createServer((socket) => {
   let rxBuffer = Buffer.alloc(0);
   let pollIndex = 0;
   let activePoll = null;
+  let waitingResponse = false;
 
   const poll = () => {
+    if (waitingResponse) return;
+
     activePoll = polls[pollIndex];
+    pollIndex = (pollIndex + 1) % polls.length;
 
     const frame = buildModbusFrame(
       activePoll.slave,
@@ -71,8 +75,8 @@ const server = net.createServer((socket) => {
       activePoll.qty
     );
 
+    waitingResponse = true;
     socket.write(frame);
-    pollIndex = (pollIndex + 1) % polls.length;
   };
 
   const pollTimer = setInterval(poll, 2000);
@@ -80,41 +84,54 @@ const server = net.createServer((socket) => {
   socket.on("data", async (data) => {
     rxBuffer = Buffer.concat([rxBuffer, data]);
 
-    if (rxBuffer.length < 7) return;
+    if (rxBuffer.length < 5) return;
 
     const byteCount = rxBuffer[2];
-    if (rxBuffer.length < 3 + byteCount) return;
+    const frameLength = 3 + byteCount + 2; // data + CRC
 
-    const payload = rxBuffer.slice(3, 3 + byteCount);
-    rxBuffer = Buffer.alloc(0);
+    if (rxBuffer.length < frameLength) return;
 
-    // 🌡️ TEMPERATURE
+    const frame = rxBuffer.slice(0, frameLength);
+    rxBuffer = rxBuffer.slice(frameLength);
+    waitingResponse = false;
+
+    const payload = frame.slice(3, 3 + byteCount);
+
+    // 🌡️ TEMPERATURE (Slave 1)
     if (activePoll.type === "temperature") {
-      const temperature = payload.readInt16BE(0);
-      console.log(`🟢 LIVE DATA | Temp: ${temperature}`);
+      let temperature = payload.readInt16BE(0);
+      temperature = temperature / 10; // scale
+
+      console.log(`🌡️ LIVE TEMP: ${temperature} °C`);
 
       await IotReading.create({
         imei: IMEI,
-        data: { temperature },
+        data: {
+          slave: 1,
+          temperature,
+        },
       });
     }
 
-    // ⚡ ENERGY METER (BULK)
+    // ⚡ ENERGY BULK (Slave 2)
     if (activePoll.type === "energyBulk") {
       const data = {
         energy: parseFloatDCBA(payload, 0),
-        power: parseFloatDCBA(payload, 28),
-        voltage: parseFloatDCBA(payload, 40),
-        current: parseFloatDCBA(payload, 44),
-        powerFactor: parseFloatDCBA(payload, 48),
-        frequency: parseFloatDCBA(payload, 52),
+        power: parseFloatDCBA(payload, 8),
+        voltage: parseFloatDCBA(payload, 12),
+        current: parseFloatDCBA(payload, 16),
+        powerFactor: parseFloatDCBA(payload, 20),
+        frequency: parseFloatDCBA(payload, 24),
       };
 
       console.log("🟢 LIVE ENERGY DATA:", data);
 
       await IotReading.create({
         imei: IMEI,
-        data,
+        data: {
+          slave: 2,
+          ...data,
+        },
       });
     }
   });
