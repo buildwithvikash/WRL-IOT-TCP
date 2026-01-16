@@ -15,44 +15,40 @@ const server = net.createServer((socket) => {
     const raw = buffer.toString().trim();
     console.log("📥 RAW DATA:", raw);
 
-    try {
-      // ✅ CASE 1: Registration packet (IMEI only)
-      if (/^\d{15}$/.test(raw)) {
-        console.log("🟢 REGISTRATION IMEI:", raw);
-
-        await IotReading.create({
-          imei: raw,
-          data: { REGISTER: true },
-        });
-
-        socket.write("OK\r\n");
-        return;
-      }
-
-      // ✅ CASE 2: Normal key=value packet
-      const parsed = {};
-      raw.split(";").forEach((pair) => {
-        if (!pair) return;
-        const [k, v] = pair.split("=");
-        if (k && v) parsed[k] = v;
-      });
-
-      if (!parsed.IMEI) {
-        console.log("❌ IMEI missing in data packet");
-        return;
-      }
-
-      console.log(`🟢 LIVE DATA | IMEI: ${parsed.IMEI}`, parsed);
+    // 🔹 CASE 1: Registration packet (only IMEI)
+    if (/^\d{15}$/.test(raw)) {
+      console.log(`🟢 REGISTRATION IMEI: ${raw}`);
 
       await IotReading.create({
-        imei: parsed.IMEI,
-        data: parsed,
+        imei: raw,
+        data: { type: "registration" },
       });
 
       socket.write("OK\r\n");
-    } catch (err) {
-      console.error("🔥 Error handling data:", err.message);
+      return;
     }
+
+    // 🔹 CASE 2: Key=Value data packet
+    const parsed = {};
+    raw.split(";").forEach((pair) => {
+      if (!pair) return;
+      const [k, v] = pair.split("=");
+      if (k && v) parsed[k] = v;
+    });
+
+    if (!parsed.IMEI) {
+      console.log("❌ IMEI missing in data packet");
+      return;
+    }
+
+    console.log(`🟢 LIVE DATA | IMEI: ${parsed.IMEI}`, parsed);
+
+    await IotReading.create({
+      imei: parsed.IMEI,
+      data: parsed,
+    });
+
+    socket.write("OK\r\n");
   });
 
   socket.on("close", () => {
