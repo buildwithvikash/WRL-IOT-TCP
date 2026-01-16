@@ -25,7 +25,7 @@ function buildModbusFrame(slave, func, start, qty) {
   ]);
 }
 
-// FLOAT CDAB
+// FLOAT CDAB (most common for energy meters)
 function parseFloatCDAB(buf, offset) {
   const reordered = Buffer.from([
     buf[offset + 2],
@@ -36,43 +36,33 @@ function parseFloatCDAB(buf, offset) {
   return reordered.readFloatBE(0);
 }
 
-// ---------------- POLL LIST ----------------
-const polls = [
-  { name: "energy", addr: 30001 },
-  { name: "power", addr: 30015 },
-  { name: "voltage", addr: 30021 },
-  { name: "current", addr: 30023 },
-  { name: "powerFactor", addr: 30025 },
-  { name: "frequency", addr: 30027 },
-];
-
 // ---------------- TCP SERVER ----------------
 const server = net.createServer((socket) => {
   console.log("📡 Gateway connected:", socket.remoteAddress);
 
   let rxBuffer = Buffer.alloc(0);
-  let pollIndex = 0;
   let waiting = false;
-  let activePoll = null;
 
-  const poll = () => {
+  // 🔍 REGISTER SCAN RANGE
+  let currentRegister = 30001;
+  const END_REGISTER = 30100;
+
+  const scan = () => {
     if (waiting) return;
 
-    activePoll = polls[pollIndex];
-    pollIndex = (pollIndex + 1) % polls.length;
-
     const frame = buildModbusFrame(
-      2,        // Slave ID
-      0x03,     // ✅ Read Input Registers
-      activePoll.addr - 1,
-      2          // 2 registers = 1 float
+      2,              // Slave ID (Energy meter)
+      0x03,           // Read Holding Registers
+      currentRegister - 1,
+      2               // 2 registers = 1 float
     );
 
+    console.log(`🔎 SCANNING REGISTER ${currentRegister}`);
     waiting = true;
     socket.write(frame);
   };
 
-  const timer = setInterval(poll, 3000);
+  const timer = setInterval(scan, 1500);
 
   socket.on("data", async (data) => {
     rxBuffer = Buffer.concat([rxBuffer, data]);
@@ -89,7 +79,7 @@ const server = net.createServer((socket) => {
 
     console.log("📥 RAW HEX:", frame.toString("hex"));
 
-    // CRC check
+    // CRC validation
     const crcRx = frame.readUInt16LE(frameLen - 2);
     const crcCalc = crc.crc16modbus(frame.slice(0, frameLen - 2));
     if (crcRx !== crcCalc) {
@@ -98,18 +88,33 @@ const server = net.createServer((socket) => {
     }
 
     const payload = frame.slice(3, 3 + byteCount);
-    const value = parseFloatCDAB(payload, 0);
 
-    console.log(`⚡ LIVE ${activePoll.name}:`, value);
+    let value = 0;
+    if (byteCount === 4) {
+      value = parseFloatCDAB(payload, 0);
+    }
 
-    await IotReading.create({
-      imei: IMEI,
-      data: {
-        slave: 2,
-        parameter: activePoll.name,
-        value,
-      },
-    });
+    console.log(
+      `📊 Register ${currentRegister} →`,
+      value
+    );
+
+    // Save only meaningful values
+    if (value !== 0 && !Number.isNaN(value)) {
+      await IotReading.create({
+        imei: IMEI,
+        data: {
+          slave: 2,
+          register: currentRegister,
+          value,
+        },
+      });
+    }
+
+    currentRegister += 2;
+    if (currentRegister > END_REGISTER) {
+      currentRegister = 30001;
+    }
   });
 
   socket.on("close", () => {
