@@ -8,37 +8,59 @@ await connectMongo();
 
 const PORT = process.env.PORT || 15000;
 
-const server = net.createServer(socket => {
+const server = net.createServer((socket) => {
   console.log("📡 Device connected:", socket.remoteAddress);
 
-  socket.on("data", async buffer => {
+  socket.on("data", async (buffer) => {
     const raw = buffer.toString().trim();
     console.log("📥 RAW DATA:", raw);
 
-    const parsed = {};
-    raw.split(";").forEach(pair => {
-      if (!pair) return;
-      const [k, v] = pair.split("=");
-      parsed[k] = v;
-    });
+    try {
+      // ✅ CASE 1: Registration packet (IMEI only)
+      if (/^\d{15}$/.test(raw)) {
+        console.log("🟢 REGISTRATION IMEI:", raw);
 
-    if (!parsed.IMEI) {
-      console.log("❌ IMEI missing");
-      return;
+        await IotReading.create({
+          imei: raw,
+          data: { REGISTER: true },
+        });
+
+        socket.write("OK\r\n");
+        return;
+      }
+
+      // ✅ CASE 2: Normal key=value packet
+      const parsed = {};
+      raw.split(";").forEach((pair) => {
+        if (!pair) return;
+        const [k, v] = pair.split("=");
+        if (k && v) parsed[k] = v;
+      });
+
+      if (!parsed.IMEI) {
+        console.log("❌ IMEI missing in data packet");
+        return;
+      }
+
+      console.log(`🟢 LIVE DATA | IMEI: ${parsed.IMEI}`, parsed);
+
+      await IotReading.create({
+        imei: parsed.IMEI,
+        data: parsed,
+      });
+
+      socket.write("OK\r\n");
+    } catch (err) {
+      console.error("🔥 Error handling data:", err.message);
     }
-
-    console.log(`🟢 LIVE DATA | IMEI: ${parsed.IMEI}`, parsed);
-
-    await IotReading.create({
-      imei: parsed.IMEI,
-      data: parsed
-    });
-
-    socket.write("OK\r\n"); // device ACK
   });
 
   socket.on("close", () => {
     console.log("🔌 Device disconnected");
+  });
+
+  socket.on("error", (err) => {
+    console.error("⚠️ Socket error:", err.message);
   });
 });
 
