@@ -19,10 +19,7 @@ function buildModbusFrame(slave, func, start, qty) {
   buf.writeUInt16BE(qty, 4);
 
   const crc16 = crc.crc16modbus(buf);
-  return Buffer.concat([
-    buf,
-    Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff]),
-  ]);
+  return Buffer.concat([buf, Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff])]);
 }
 
 // FLOAT CDAB
@@ -47,10 +44,10 @@ const server = net.createServer((socket) => {
     if (waiting) return;
 
     const frame = buildModbusFrame(
-      2,          // Slave ID
-      0x03,       // Read Holding Registers
-      30001 - 1,  // Start address
-      28          // 14 registers = 7 floats
+      2, // Slave ID
+      0x03, // Read Holding Registers
+      30001 - 1, // Start address
+      28 // 14 registers = 7 floats
     );
 
     waiting = true;
@@ -84,7 +81,7 @@ const server = net.createServer((socket) => {
 
     const payload = frame.slice(3, 3 + byteCount);
 
-    const data = {
+    const energyData = {
       energy: parseFloatCDAB(payload, 0),
       power: parseFloatCDAB(payload, 28),
       voltage: parseFloatCDAB(payload, 40),
@@ -93,13 +90,13 @@ const server = net.createServer((socket) => {
       frequency: parseFloatCDAB(payload, 52),
     };
 
-    console.log("⚡ LIVE ENERGY DATA:", data);
+    console.log("⚡ LIVE ENERGY DATA:", energyData);
 
     await IotReading.create({
       imei: IMEI,
       data: {
         slave: 2,
-        ...data,
+        ...energyData,
       },
     });
   });
