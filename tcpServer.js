@@ -25,33 +25,32 @@ function buildModbusFrame(slave, func, start, qty) {
   ]);
 }
 
-function parseFloatCDAB(buf, offset) {
+function parseFloatDCBA(buf, offset) {
   const reordered = Buffer.from([
-    buf[offset + 2],
     buf[offset + 3],
-    buf[offset + 0],
+    buf[offset + 2],
     buf[offset + 1],
+    buf[offset + 0],
   ]);
   return reordered.readFloatBE(0);
 }
 
-// ---------------- DEVICE MAP ----------------
-const pollList = [
-  // 🌡️ Temperature Indicator (Slave 1)
+// ---------------- POLL DEFINITIONS ----------------
+const polls = [
   {
+    type: "temperature",
     slave: 1,
-    name: "temperature",
-    addr: 44097,
-    type: "short",
+    func: 0x04,
+    start: 44097,
+    qty: 1,
   },
-
-  // ⚡ Energy Meter (Slave 2)
-  { slave: 2, name: "energy", addr: 30001, type: "float" },
-  { slave: 2, name: "power", addr: 30015, type: "float" },
-  { slave: 2, name: "voltage", addr: 30021, type: "float" },
-  { slave: 2, name: "current", addr: 30023, type: "float" },
-  { slave: 2, name: "powerFactor", addr: 30025, type: "float" },
-  { slave: 2, name: "frequency", addr: 30027, type: "float" },
+  {
+    type: "energyBulk",
+    slave: 2,
+    func: 0x03,
+    start: 30001,
+    qty: 28,
+  },
 ];
 
 // ---------------- TCP SERVER ----------------
@@ -63,20 +62,17 @@ const server = net.createServer((socket) => {
   let activePoll = null;
 
   const poll = () => {
-    activePoll = pollList[pollIndex];
-
-    const qty = activePoll.type === "short" ? 1 : 2;
-    const func = activePoll.addr >= 40000 ? 0x04 : 0x03;
+    activePoll = polls[pollIndex];
 
     const frame = buildModbusFrame(
       activePoll.slave,
-      func,
-      activePoll.addr - 1,
-      qty
+      activePoll.func,
+      activePoll.start - 1,
+      activePoll.qty
     );
 
     socket.write(frame);
-    pollIndex = (pollIndex + 1) % pollList.length;
+    pollIndex = (pollIndex + 1) % polls.length;
   };
 
   const pollTimer = setInterval(poll, 2000);
@@ -92,26 +88,35 @@ const server = net.createServer((socket) => {
     const payload = rxBuffer.slice(3, 3 + byteCount);
     rxBuffer = Buffer.alloc(0);
 
-    let value;
-    if (activePoll.type === "short") {
-      value = payload.readInt16BE(0);
-    } else {
-      value = parseFloatCDAB(payload, 0);
+    // 🌡️ TEMPERATURE
+    if (activePoll.type === "temperature") {
+      const temperature = payload.readInt16BE(0);
+      console.log(`🟢 LIVE DATA | Temp: ${temperature}`);
+
+      await IotReading.create({
+        imei: IMEI,
+        data: { temperature },
+      });
     }
 
-    console.log(
-      `🟢 LIVE DATA | Slave ${activePoll.slave} | ${activePoll.name}:`,
-      value
-    );
+    // ⚡ ENERGY METER (BULK)
+    if (activePoll.type === "energyBulk") {
+      const data = {
+        energy: parseFloatDCBA(payload, 0),
+        power: parseFloatDCBA(payload, 28),
+        voltage: parseFloatDCBA(payload, 40),
+        current: parseFloatDCBA(payload, 44),
+        powerFactor: parseFloatDCBA(payload, 48),
+        frequency: parseFloatDCBA(payload, 52),
+      };
 
-    await IotReading.create({
-      imei: IMEI,
-      data: {
-        slave: activePoll.slave,
-        parameter: activePoll.name,
-        value,
-      },
-    });
+      console.log("🟢 LIVE ENERGY DATA:", data);
+
+      await IotReading.create({
+        imei: IMEI,
+        data,
+      });
+    }
   });
 
   socket.on("close", () => {
