@@ -1,6 +1,5 @@
 import net from "net";
 import dotenv from "dotenv";
-import crc from "crc";
 import { connectMongo } from "./mongo.js";
 import IotReading from "./models/IotReading.js";
 
@@ -10,134 +9,32 @@ await connectMongo();
 const PORT = process.env.PORT || 15000;
 const IMEI = "865661071962420";
 
-// ---------------- MODBUS HELPERS ----------------
-function buildModbusFrame(slave, func, start, qty) {
-  const buf = Buffer.alloc(6);
-  buf.writeUInt8(slave, 0);
-  buf.writeUInt8(func, 1);
-  buf.writeUInt16BE(start, 2);
-  buf.writeUInt16BE(qty, 4);
-
-  const crc16 = crc.crc16modbus(buf);
-  return Buffer.concat([
-    buf,
-    Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff]),
-  ]);
-}
-
-function parseFloatDCBA(buf, offset) {
-  const reordered = Buffer.from([
-    buf[offset + 3],
-    buf[offset + 2],
-    buf[offset + 1],
-    buf[offset + 0],
-  ]);
-  return reordered.readFloatBE(0);
-}
-
-// ---------------- POLL DEFINITIONS ----------------
-const polls = [
-  {
-    type: "temperature",
-    slave: 1,
-    func: 0x04,
-    start: 44097,
-    qty: 1,
-  },
-  {
-    type: "energyBulk",
-    slave: 2,
-    func: 0x03,
-    start: 30001,
-    qty: 28, // 14 registers = 7 floats
-  },
-];
-
-// ---------------- TCP SERVER ----------------
 const server = net.createServer((socket) => {
   console.log("📡 Gateway connected:", socket.remoteAddress);
 
-  let rxBuffer = Buffer.alloc(0);
-  let pollIndex = 0;
-  let activePoll = null;
-  let waitingResponse = false;
+  socket.on("data", async (buffer) => {
+    // RAW formats
+    const hex = buffer.toString("hex");
+    const ascii = buffer.toString("utf8");
 
-  const poll = () => {
-    if (waitingResponse) return;
+    console.log("📥 RAW HEX   :", hex);
+    console.log("📥 RAW ASCII:", ascii);
 
-    activePoll = polls[pollIndex];
-    pollIndex = (pollIndex + 1) % polls.length;
+    // Store raw dump
+    await IotReading.create({
+      imei: IMEI,
+      data: {
+        rawHex: hex,
+        rawAscii: ascii,
+        length: buffer.length,
+      },
+    });
 
-    const frame = buildModbusFrame(
-      activePoll.slave,
-      activePoll.func,
-      activePoll.start - 1,
-      activePoll.qty
-    );
-
-    waitingResponse = true;
-    socket.write(frame);
-  };
-
-  const pollTimer = setInterval(poll, 2000);
-
-  socket.on("data", async (data) => {
-    rxBuffer = Buffer.concat([rxBuffer, data]);
-
-    if (rxBuffer.length < 5) return;
-
-    const byteCount = rxBuffer[2];
-    const frameLength = 3 + byteCount + 2; // data + CRC
-
-    if (rxBuffer.length < frameLength) return;
-
-    const frame = rxBuffer.slice(0, frameLength);
-    rxBuffer = rxBuffer.slice(frameLength);
-    waitingResponse = false;
-
-    const payload = frame.slice(3, 3 + byteCount);
-
-    // 🌡️ TEMPERATURE (Slave 1)
-    if (activePoll.type === "temperature") {
-      let temperature = payload.readInt16BE(0);
-      temperature = temperature / 10; // scale
-
-      console.log(`🌡️ LIVE TEMP: ${temperature} °C`);
-
-      await IotReading.create({
-        imei: IMEI,
-        data: {
-          slave: 1,
-          temperature,
-        },
-      });
-    }
-
-    // ⚡ ENERGY BULK (Slave 2)
-    if (activePoll.type === "energyBulk") {
-      const data = {
-        energy: parseFloatDCBA(payload, 0),
-        power: parseFloatDCBA(payload, 8),
-        voltage: parseFloatDCBA(payload, 12),
-        current: parseFloatDCBA(payload, 16),
-        powerFactor: parseFloatDCBA(payload, 20),
-        frequency: parseFloatDCBA(payload, 24),
-      };
-
-      console.log("🟢 LIVE ENERGY DATA:", data);
-
-      await IotReading.create({
-        imei: IMEI,
-        data: {
-          slave: 2,
-          ...data,
-        },
-      });
-    }
+    // ACK (some gateways expect this)
+    socket.write("OK\r\n");
   });
 
   socket.on("close", () => {
-    clearInterval(pollTimer);
     console.log("🔌 Gateway disconnected");
   });
 
@@ -147,6 +44,5 @@ const server = net.createServer((socket) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 TCP Server running on port ${PORT}`);
+  console.log(`🚀 RAW TCP Server listening on port ${PORT}`);
 });
-
