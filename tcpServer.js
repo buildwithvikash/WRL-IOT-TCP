@@ -25,7 +25,7 @@ function buildModbusFrame(slave, func, start, qty) {
   ]);
 }
 
-// FLOAT = CDAB
+// FLOAT CDAB
 function parseFloatCDAB(buf, offset) {
   const reordered = Buffer.from([
     buf[offset + 2],
@@ -38,20 +38,8 @@ function parseFloatCDAB(buf, offset) {
 
 // ---------------- POLLS ----------------
 const polls = [
-  {
-    name: "temperature",
-    slave: 1,
-    func: 0x04,
-    start: 44097,
-    qty: 1,
-  },
-  {
-    name: "energy",
-    slave: 2,
-    func: 0x03,
-    start: 30001,
-    qty: 28, // 14 registers = 7 floats
-  },
+  { name: "temperature", slave: 1, func: 0x04, start: 44097, qty: 1 },
+  { name: "energy", slave: 2, func: 0x03, start: 30001, qty: 28 },
 ];
 
 // ---------------- TCP SERVER ----------------
@@ -84,35 +72,29 @@ const server = net.createServer((socket) => {
 
   socket.on("data", async (data) => {
     rxBuffer = Buffer.concat([rxBuffer, data]);
-
     if (rxBuffer.length < 7) return;
 
-    const slave = rxBuffer[0];
-    const func = rxBuffer[1];
     const byteCount = rxBuffer[2];
     const frameLength = 3 + byteCount + 2;
-
     if (rxBuffer.length < frameLength) return;
 
     const frame = rxBuffer.slice(0, frameLength);
     rxBuffer = rxBuffer.slice(frameLength);
     waiting = false;
 
-    // CRC check
+    // CRC
     const crcRx = frame.readUInt16LE(frameLength - 2);
     const crcCalc = crc.crc16modbus(frame.slice(0, frameLength - 2));
     if (crcRx !== crcCalc) return;
 
-    // Validate response
-    if (slave !== activePoll.slave || func !== activePoll.func) return;
-
     const payload = frame.slice(3, 3 + byteCount);
+
+    // 🔎 DEBUG (KEEP FOR NOW)
+    console.log("📦 RAW HEX:", payload.toString("hex"));
 
     // 🌡️ TEMPERATURE
     if (activePoll.name === "temperature") {
-      const raw = payload.readInt16BE(0);
-      const temperature = raw / 10;
-
+      const temperature = payload.readInt16BE(0) / 10;
       console.log(`🌡️ LIVE TEMP: ${temperature} °C`);
 
       await IotReading.create({
@@ -144,10 +126,6 @@ const server = net.createServer((socket) => {
   socket.on("close", () => {
     clearInterval(timer);
     console.log("🔌 Gateway disconnected");
-  });
-
-  socket.on("error", (err) => {
-    console.error("⚠️ Socket error:", err.message);
   });
 });
 
