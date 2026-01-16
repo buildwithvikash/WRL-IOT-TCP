@@ -19,7 +19,10 @@ function buildModbusFrame(slave, func, start, qty) {
   buf.writeUInt16BE(qty, 4);
 
   const crc16 = crc.crc16modbus(buf);
-  return Buffer.concat([buf, Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff])]);
+  return Buffer.concat([
+    buf,
+    Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff]),
+  ]);
 }
 
 // FLOAT CDAB
@@ -33,28 +36,43 @@ function parseFloatCDAB(buf, offset) {
   return reordered.readFloatBE(0);
 }
 
+// ---------------- POLL LIST ----------------
+const polls = [
+  { name: "energy", addr: 30001 },
+  { name: "power", addr: 30015 },
+  { name: "voltage", addr: 30021 },
+  { name: "current", addr: 30023 },
+  { name: "powerFactor", addr: 30025 },
+  { name: "frequency", addr: 30027 },
+];
+
 // ---------------- TCP SERVER ----------------
 const server = net.createServer((socket) => {
   console.log("📡 Gateway connected:", socket.remoteAddress);
 
   let rxBuffer = Buffer.alloc(0);
+  let pollIndex = 0;
   let waiting = false;
+  let activePoll = null;
 
-  const pollEnergy = () => {
+  const poll = () => {
     if (waiting) return;
 
+    activePoll = polls[pollIndex];
+    pollIndex = (pollIndex + 1) % polls.length;
+
     const frame = buildModbusFrame(
-      2, // Slave ID
-      0x03, // Read Holding Registers
-      30001 - 1, // Start address
-      28 // 14 registers = 7 floats
+      2,        // Slave ID
+      0x04,     // ✅ Read Input Registers
+      activePoll.addr - 1,
+      2          // 2 registers = 1 float
     );
 
     waiting = true;
     socket.write(frame);
   };
 
-  const timer = setInterval(pollEnergy, 3000);
+  const timer = setInterval(poll, 3000);
 
   socket.on("data", async (data) => {
     rxBuffer = Buffer.concat([rxBuffer, data]);
@@ -80,23 +98,16 @@ const server = net.createServer((socket) => {
     }
 
     const payload = frame.slice(3, 3 + byteCount);
+    const value = parseFloatCDAB(payload, 0);
 
-    const energyData = {
-      energy: parseFloatCDAB(payload, 0),
-      power: parseFloatCDAB(payload, 28),
-      voltage: parseFloatCDAB(payload, 40),
-      current: parseFloatCDAB(payload, 44),
-      powerFactor: parseFloatCDAB(payload, 48),
-      frequency: parseFloatCDAB(payload, 52),
-    };
-
-    console.log("⚡ LIVE ENERGY DATA:", energyData);
+    console.log(`⚡ LIVE ${activePoll.name}:`, value);
 
     await IotReading.create({
       imei: IMEI,
       data: {
         slave: 2,
-        ...energyData,
+        parameter: activePoll.name,
+        value,
       },
     });
   });
