@@ -11,11 +11,24 @@ const PORT = process.env.PORT || 15000;
 const server = net.createServer((socket) => {
   console.log("📡 Device connected:", socket.remoteAddress);
 
-  socket.on("data", async (buffer) => {
-    const raw = buffer.toString().trim();
+  let bufferData = ""; // 🔴 IMPORTANT: TCP buffer
+
+  socket.on("data", async (chunk) => {
+    bufferData += chunk.toString();
+
+    // Wait until a full packet is received
+    if (!bufferData.includes("\n") && !bufferData.includes(";")) {
+      return;
+    }
+
+    const raw = bufferData.trim();
+    bufferData = ""; // clear buffer
+
     console.log("📥 RAW DATA:", raw);
 
-    // 🔹 CASE 1: Registration packet (only IMEI)
+    /* -----------------------------
+       CASE 1: Registration packet
+       ----------------------------- */
     if (/^\d{15}$/.test(raw)) {
       console.log(`🟢 REGISTRATION IMEI: ${raw}`);
 
@@ -28,27 +41,32 @@ const server = net.createServer((socket) => {
       return;
     }
 
-    // 🔹 CASE 2: Key=Value data packet
+    /* -----------------------------
+       CASE 2: Telemetry packet
+       ----------------------------- */
     const parsed = {};
     raw.split(";").forEach((pair) => {
       if (!pair) return;
       const [k, v] = pair.split("=");
-      if (k && v) parsed[k] = v;
+      if (k && v) parsed[k.trim()] = v.trim();
     });
 
     if (!parsed.IMEI) {
-      console.log("❌ IMEI missing in data packet");
+      console.log("❌ IMEI missing in telemetry packet");
       return;
     }
 
-    console.log(`🟢 LIVE DATA | IMEI: ${parsed.IMEI}`, parsed);
+    console.log(
+      `🟢 LIVE DATA | IMEI: ${parsed.IMEI}`,
+      parsed
+    );
 
     await IotReading.create({
       imei: parsed.IMEI,
       data: parsed,
     });
 
-    socket.write("OK\r\n");
+    socket.write("OK\r\n"); // ACK to device
   });
 
   socket.on("close", () => {
