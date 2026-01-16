@@ -19,10 +19,7 @@ function buildModbusFrame(slave, func, start, qty) {
   buf.writeUInt16BE(qty, 4);
 
   const crc16 = crc.crc16modbus(buf);
-  return Buffer.concat([
-    buf,
-    Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff]),
-  ]);
+  return Buffer.concat([buf, Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff])]);
 }
 
 // FLOAT = CDAB
@@ -51,10 +48,10 @@ const server = net.createServer((socket) => {
     if (waiting) return;
 
     const frame = buildModbusFrame(
-      2,        // Slave ID
-      0x04,     // ✅ Read INPUT registers
+      2, // Slave ID
+      0x04, // ✅ Read INPUT registers
       currentRegister - 1,
-      2         // 2 registers = float
+      2 // 2 registers = float
     );
 
     console.log(`🔎 SCANNING REGISTER ${currentRegister}`);
@@ -74,20 +71,27 @@ const server = net.createServer((socket) => {
   socket.on("data", async (data) => {
     rxBuffer = Buffer.concat([rxBuffer, data]);
 
+    // 🔥 STRIP ASCII IMEI IF PRESENT
+    while (rxBuffer.length >= 15) {
+      const ascii = rxBuffer.slice(0, 15).toString();
+      if (/^\d{15}$/.test(ascii)) {
+        console.log("🧹 Stripped IMEI:", ascii);
+        rxBuffer = rxBuffer.slice(15);
+      } else {
+        break;
+      }
+    }
+
     if (rxBuffer.length < 5) return;
 
     const slave = rxBuffer[0];
     const func = rxBuffer[1];
 
-    // 🔴 MODBUS EXCEPTION
+    // ❌ Modbus exception
     if (func & 0x80) {
-      console.log(
-        `❌ Modbus exception from slave ${slave}, code ${rxBuffer[2]}`
-      );
+      console.log(`❌ Modbus exception code ${rxBuffer[2]}`);
       rxBuffer = Buffer.alloc(0);
       waiting = false;
-      clearTimeout(timeoutHandle);
-      currentRegister += 2;
       return;
     }
 
@@ -98,9 +102,8 @@ const server = net.createServer((socket) => {
     const frame = rxBuffer.slice(0, frameLen);
     rxBuffer = rxBuffer.slice(frameLen);
     waiting = false;
-    clearTimeout(timeoutHandle);
 
-    console.log("📥 RAW HEX:", frame.toString("hex"));
+    console.log("📥 MODBUS FRAME:", frame.toString("hex"));
 
     // CRC check
     const crcRx = frame.readUInt16LE(frameLen - 2);
@@ -111,25 +114,9 @@ const server = net.createServer((socket) => {
     }
 
     const payload = frame.slice(3, 3 + byteCount);
-    console.log("📦 PAYLOAD HEX:", payload.toString("hex"));
 
-    let value = 0;
-    if (byteCount === 4) {
-      value = parseFloatCDAB(payload, 0);
-    }
-
+    let value = parseFloatCDAB(payload, 0);
     console.log(`📊 Register ${currentRegister} →`, value);
-
-    if (value !== 0 && !Number.isNaN(value)) {
-      await IotReading.create({
-        imei: IMEI,
-        data: {
-          slave: 2,
-          register: currentRegister,
-          value,
-        },
-      });
-    }
 
     currentRegister += 2;
     if (currentRegister > END_REGISTER) currentRegister = 30001;
