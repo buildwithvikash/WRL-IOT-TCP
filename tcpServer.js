@@ -1,5 +1,6 @@
 import net from "net";
 import dotenv from "dotenv";
+import crc from "crc";
 import { connectMongo } from "./mongo.js";
 import IotReading from "./models/IotReading.js";
 
@@ -7,70 +8,115 @@ dotenv.config();
 await connectMongo();
 
 const PORT = process.env.PORT || 15000;
+const IMEI = "865661071962420";
 
+// ---------------- MODBUS HELPERS ----------------
+function buildModbusFrame(slave, func, start, qty) {
+  const buf = Buffer.alloc(6);
+  buf.writeUInt8(slave, 0);
+  buf.writeUInt8(func, 1);
+  buf.writeUInt16BE(start, 2);
+  buf.writeUInt16BE(qty, 4);
+
+  const crc16 = crc.crc16modbus(buf);
+  return Buffer.concat([
+    buf,
+    Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff]),
+  ]);
+}
+
+function parseFloatCDAB(buf, offset) {
+  const reordered = Buffer.from([
+    buf[offset + 2],
+    buf[offset + 3],
+    buf[offset + 0],
+    buf[offset + 1],
+  ]);
+  return reordered.readFloatBE(0);
+}
+
+// ---------------- DEVICE MAP ----------------
+const pollList = [
+  // 🌡️ Temperature Indicator (Slave 1)
+  {
+    slave: 1,
+    name: "temperature",
+    addr: 44097,
+    type: "short",
+  },
+
+  // ⚡ Energy Meter (Slave 2)
+  { slave: 2, name: "energy", addr: 30001, type: "float" },
+  { slave: 2, name: "power", addr: 30015, type: "float" },
+  { slave: 2, name: "voltage", addr: 30021, type: "float" },
+  { slave: 2, name: "current", addr: 30023, type: "float" },
+  { slave: 2, name: "powerFactor", addr: 30025, type: "float" },
+  { slave: 2, name: "frequency", addr: 30027, type: "float" },
+];
+
+// ---------------- TCP SERVER ----------------
 const server = net.createServer((socket) => {
-  console.log("📡 Device connected:", socket.remoteAddress);
+  console.log("📡 Gateway connected:", socket.remoteAddress);
 
-  let bufferData = ""; // 🔴 IMPORTANT: TCP buffer
+  let rxBuffer = Buffer.alloc(0);
+  let pollIndex = 0;
+  let activePoll = null;
 
-  socket.on("data", async (chunk) => {
-    bufferData += chunk.toString();
+  const poll = () => {
+    activePoll = pollList[pollIndex];
 
-    // Wait until a full packet is received
-    if (!bufferData.includes("\n") && !bufferData.includes(";")) {
-      return;
-    }
+    const qty = activePoll.type === "short" ? 1 : 2;
+    const func = activePoll.addr >= 40000 ? 0x04 : 0x03;
 
-    const raw = bufferData.trim();
-    bufferData = ""; // clear buffer
+    const frame = buildModbusFrame(
+      activePoll.slave,
+      func,
+      activePoll.addr - 1,
+      qty
+    );
 
-    console.log("📥 RAW DATA:", raw);
+    socket.write(frame);
+    pollIndex = (pollIndex + 1) % pollList.length;
+  };
 
-    /* -----------------------------
-       CASE 1: Registration packet
-       ----------------------------- */
-    if (/^\d{15}$/.test(raw)) {
-      console.log(`🟢 REGISTRATION IMEI: ${raw}`);
+  const pollTimer = setInterval(poll, 2000);
 
-      await IotReading.create({
-        imei: raw,
-        data: { type: "registration" },
-      });
+  socket.on("data", async (data) => {
+    rxBuffer = Buffer.concat([rxBuffer, data]);
 
-      socket.write("OK\r\n");
-      return;
-    }
+    if (rxBuffer.length < 7) return;
 
-    /* -----------------------------
-       CASE 2: Telemetry packet
-       ----------------------------- */
-    const parsed = {};
-    raw.split(";").forEach((pair) => {
-      if (!pair) return;
-      const [k, v] = pair.split("=");
-      if (k && v) parsed[k.trim()] = v.trim();
-    });
+    const byteCount = rxBuffer[2];
+    if (rxBuffer.length < 3 + byteCount) return;
 
-    if (!parsed.IMEI) {
-      console.log("❌ IMEI missing in telemetry packet");
-      return;
+    const payload = rxBuffer.slice(3, 3 + byteCount);
+    rxBuffer = Buffer.alloc(0);
+
+    let value;
+    if (activePoll.type === "short") {
+      value = payload.readInt16BE(0);
+    } else {
+      value = parseFloatCDAB(payload, 0);
     }
 
     console.log(
-      `🟢 LIVE DATA | IMEI: ${parsed.IMEI}`,
-      parsed
+      `🟢 LIVE DATA | Slave ${activePoll.slave} | ${activePoll.name}:`,
+      value
     );
 
     await IotReading.create({
-      imei: parsed.IMEI,
-      data: parsed,
+      imei: IMEI,
+      data: {
+        slave: activePoll.slave,
+        parameter: activePoll.name,
+        value,
+      },
     });
-
-    socket.write("OK\r\n"); // ACK to device
   });
 
   socket.on("close", () => {
-    console.log("🔌 Device disconnected");
+    clearInterval(pollTimer);
+    console.log("🔌 Gateway disconnected");
   });
 
   socket.on("error", (err) => {
