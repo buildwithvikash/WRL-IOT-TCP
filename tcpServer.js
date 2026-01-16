@@ -12,26 +12,9 @@ const IMEI = "865661071962420";
 const server = net.createServer((socket) => {
   console.log("📡 Gateway connected:", socket.remoteAddress);
 
-  socket.on("data", async (buffer) => {
-    // RAW formats
-    const hex = buffer.toString("hex");
-    const ascii = buffer.toString("utf8");
-
-    console.log("📥 RAW HEX   :", hex);
-    console.log("📥 RAW ASCII:", ascii);
-
-    // Store raw dump
-    await IotReading.create({
-      imei: IMEI,
-      data: {
-        rawHex: hex,
-        rawAscii: ascii,
-        length: buffer.length,
-      },
-    });
-
-    // ACK (some gateways expect this)
-    socket.write("OK\r\n");
+  socket.on("data", (data) => {
+    console.log("📥 RAW HEX   :", data.toString("hex"));
+    console.log("📥 RAW ASCII:", data.toString());
   });
 
   socket.on("close", () => {
