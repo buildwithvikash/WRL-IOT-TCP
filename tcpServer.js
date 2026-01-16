@@ -25,21 +25,32 @@ function buildModbusFrame(slave, func, start, qty) {
   ]);
 }
 
-// FLOAT CDAB
-function parseFloatCDAB(buf, offset) {
+function parseFloatDCBA(buf, offset) {
   const reordered = Buffer.from([
-    buf[offset + 2],
     buf[offset + 3],
-    buf[offset + 0],
+    buf[offset + 2],
     buf[offset + 1],
+    buf[offset + 0],
   ]);
   return reordered.readFloatBE(0);
 }
 
-// ---------------- POLLS ----------------
+// ---------------- POLL DEFINITIONS ----------------
 const polls = [
-  { name: "temperature", slave: 1, func: 0x04, start: 44097, qty: 1 },
-  { name: "energy", slave: 2, func: 0x03, start: 30001, qty: 28 },
+  {
+    type: "temperature",
+    slave: 1,
+    func: 0x04,
+    start: 44097,
+    qty: 1,
+  },
+  {
+    type: "energyBulk",
+    slave: 2,
+    func: 0x03,
+    start: 30001,
+    qty: 28, // 14 registers = 7 floats
+  },
 ];
 
 // ---------------- TCP SERVER ----------------
@@ -49,10 +60,10 @@ const server = net.createServer((socket) => {
   let rxBuffer = Buffer.alloc(0);
   let pollIndex = 0;
   let activePoll = null;
-  let waiting = false;
+  let waitingResponse = false;
 
   const poll = () => {
-    if (waiting) return;
+    if (waitingResponse) return;
 
     activePoll = polls[pollIndex];
     pollIndex = (pollIndex + 1) % polls.length;
@@ -64,71 +75,78 @@ const server = net.createServer((socket) => {
       activePoll.qty
     );
 
-    waiting = true;
+    waitingResponse = true;
     socket.write(frame);
   };
 
-  const timer = setInterval(poll, 2000);
+  const pollTimer = setInterval(poll, 2000);
 
   socket.on("data", async (data) => {
     rxBuffer = Buffer.concat([rxBuffer, data]);
-    if (rxBuffer.length < 7) return;
+
+    if (rxBuffer.length < 5) return;
 
     const byteCount = rxBuffer[2];
-    const frameLength = 3 + byteCount + 2;
+    const frameLength = 3 + byteCount + 2; // data + CRC
+
     if (rxBuffer.length < frameLength) return;
 
     const frame = rxBuffer.slice(0, frameLength);
     rxBuffer = rxBuffer.slice(frameLength);
-    waiting = false;
-
-    // CRC
-    const crcRx = frame.readUInt16LE(frameLength - 2);
-    const crcCalc = crc.crc16modbus(frame.slice(0, frameLength - 2));
-    if (crcRx !== crcCalc) return;
+    waitingResponse = false;
 
     const payload = frame.slice(3, 3 + byteCount);
 
-    // 🔎 DEBUG (KEEP FOR NOW)
-    console.log("📦 RAW HEX:", payload.toString("hex"));
+    // 🌡️ TEMPERATURE (Slave 1)
+    if (activePoll.type === "temperature") {
+      let temperature = payload.readInt16BE(0);
+      temperature = temperature / 10; // scale
 
-    // 🌡️ TEMPERATURE
-    if (activePoll.name === "temperature") {
-      const temperature = payload.readInt16BE(0) / 10;
       console.log(`🌡️ LIVE TEMP: ${temperature} °C`);
 
       await IotReading.create({
         imei: IMEI,
-        data: { temperature },
+        data: {
+          slave: 1,
+          temperature,
+        },
       });
     }
 
-    // ⚡ ENERGY BULK
-    if (activePoll.name === "energy") {
+    // ⚡ ENERGY BULK (Slave 2)
+    if (activePoll.type === "energyBulk") {
       const data = {
-        energy: parseFloatCDAB(payload, 0),
-        power: parseFloatCDAB(payload, 28),
-        voltage: parseFloatCDAB(payload, 40),
-        current: parseFloatCDAB(payload, 44),
-        powerFactor: parseFloatCDAB(payload, 48),
-        frequency: parseFloatCDAB(payload, 52),
+        energy: parseFloatDCBA(payload, 0),
+        power: parseFloatDCBA(payload, 8),
+        voltage: parseFloatDCBA(payload, 12),
+        current: parseFloatDCBA(payload, 16),
+        powerFactor: parseFloatDCBA(payload, 20),
+        frequency: parseFloatDCBA(payload, 24),
       };
 
-      console.log("⚡ LIVE ENERGY:", data);
+      console.log("🟢 LIVE ENERGY DATA:", data);
 
       await IotReading.create({
         imei: IMEI,
-        data,
+        data: {
+          slave: 2,
+          ...data,
+        },
       });
     }
   });
 
   socket.on("close", () => {
-    clearInterval(timer);
+    clearInterval(pollTimer);
     console.log("🔌 Gateway disconnected");
+  });
+
+  socket.on("error", (err) => {
+    console.error("⚠️ Socket error:", err.message);
   });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 TCP Server running on port ${PORT}`);
 });
+
