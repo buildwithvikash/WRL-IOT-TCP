@@ -25,27 +25,28 @@ function buildModbusFrame(slave, func, start, qty) {
   ]);
 }
 
-function parseFloatDCBA(buf, offset) {
+// FLOAT = CDAB
+function parseFloatCDAB(buf, offset) {
   const reordered = Buffer.from([
-    buf[offset + 3],
     buf[offset + 2],
-    buf[offset + 1],
+    buf[offset + 3],
     buf[offset + 0],
+    buf[offset + 1],
   ]);
   return reordered.readFloatBE(0);
 }
 
-// ---------------- POLL DEFINITIONS ----------------
+// ---------------- POLLS ----------------
 const polls = [
   {
-    type: "temperature",
+    name: "temperature",
     slave: 1,
     func: 0x04,
     start: 44097,
     qty: 1,
   },
   {
-    type: "energyBulk",
+    name: "energy",
     slave: 2,
     func: 0x03,
     start: 30001,
@@ -60,10 +61,10 @@ const server = net.createServer((socket) => {
   let rxBuffer = Buffer.alloc(0);
   let pollIndex = 0;
   let activePoll = null;
-  let waitingResponse = false;
+  let waiting = false;
 
   const poll = () => {
-    if (waitingResponse) return;
+    if (waiting) return;
 
     activePoll = polls[pollIndex];
     pollIndex = (pollIndex + 1) % polls.length;
@@ -75,69 +76,73 @@ const server = net.createServer((socket) => {
       activePoll.qty
     );
 
-    waitingResponse = true;
+    waiting = true;
     socket.write(frame);
   };
 
-  const pollTimer = setInterval(poll, 2000);
+  const timer = setInterval(poll, 2000);
 
   socket.on("data", async (data) => {
     rxBuffer = Buffer.concat([rxBuffer, data]);
 
-    if (rxBuffer.length < 5) return;
+    if (rxBuffer.length < 7) return;
 
+    const slave = rxBuffer[0];
+    const func = rxBuffer[1];
     const byteCount = rxBuffer[2];
-    const frameLength = 3 + byteCount + 2; // data + CRC
+    const frameLength = 3 + byteCount + 2;
 
     if (rxBuffer.length < frameLength) return;
 
     const frame = rxBuffer.slice(0, frameLength);
     rxBuffer = rxBuffer.slice(frameLength);
-    waitingResponse = false;
+    waiting = false;
+
+    // CRC check
+    const crcRx = frame.readUInt16LE(frameLength - 2);
+    const crcCalc = crc.crc16modbus(frame.slice(0, frameLength - 2));
+    if (crcRx !== crcCalc) return;
+
+    // Validate response
+    if (slave !== activePoll.slave || func !== activePoll.func) return;
 
     const payload = frame.slice(3, 3 + byteCount);
 
-    // 🌡️ TEMPERATURE (Slave 1)
-    if (activePoll.type === "temperature") {
-      let temperature = payload.readInt16BE(0);
-      temperature = temperature / 10; // scale
+    // 🌡️ TEMPERATURE
+    if (activePoll.name === "temperature") {
+      const raw = payload.readInt16BE(0);
+      const temperature = raw / 10;
 
       console.log(`🌡️ LIVE TEMP: ${temperature} °C`);
 
       await IotReading.create({
         imei: IMEI,
-        data: {
-          slave: 1,
-          temperature,
-        },
+        data: { temperature },
       });
     }
 
-    // ⚡ ENERGY BULK (Slave 2)
-    if (activePoll.type === "energyBulk") {
+    // ⚡ ENERGY BULK
+    if (activePoll.name === "energy") {
       const data = {
-        energy: parseFloatDCBA(payload, 0),
-        power: parseFloatDCBA(payload, 8),
-        voltage: parseFloatDCBA(payload, 12),
-        current: parseFloatDCBA(payload, 16),
-        powerFactor: parseFloatDCBA(payload, 20),
-        frequency: parseFloatDCBA(payload, 24),
+        energy: parseFloatCDAB(payload, 0),
+        power: parseFloatCDAB(payload, 28),
+        voltage: parseFloatCDAB(payload, 40),
+        current: parseFloatCDAB(payload, 44),
+        powerFactor: parseFloatCDAB(payload, 48),
+        frequency: parseFloatCDAB(payload, 52),
       };
 
-      console.log("🟢 LIVE ENERGY DATA:", data);
+      console.log("⚡ LIVE ENERGY:", data);
 
       await IotReading.create({
         imei: IMEI,
-        data: {
-          slave: 2,
-          ...data,
-        },
+        data,
       });
     }
   });
 
   socket.on("close", () => {
-    clearInterval(pollTimer);
+    clearInterval(timer);
     console.log("🔌 Gateway disconnected");
   });
 
