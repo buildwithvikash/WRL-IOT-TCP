@@ -33,10 +33,10 @@ const server = net.createServer((socket) => {
     if (waiting) return;
 
     const frame = buildModbusFrame(
-      1,          // ✅ Slave ID = 1
-      0x04,       // ✅ Read Input Registers
-      44097 - 1,  // Modbus offset
-      1           // 1 register (INT16)
+      1, // ✅ Slave ID = 1
+      0x04, // ✅ Read Input Registers
+      44097 - 1, // Modbus offset
+      1 // 1 register (INT16)
     );
 
     waiting = true;
@@ -45,52 +45,19 @@ const server = net.createServer((socket) => {
 
   const timer = setInterval(pollTemperature, 2000);
 
-  socket.on("data", async (data) => {
-    rxBuffer = Buffer.concat([rxBuffer, data]);
+  socket.on("data", (buf) => {
+    console.log("📥 RAW HEX   :", buf.toString("hex"));
+    console.log("📥 RAW ASCII:", buf.toString("ascii"));
 
-    // Strip IMEI if gateway sends it
-    while (rxBuffer.length >= 15) {
-      const ascii = rxBuffer.slice(0, 15).toString();
-      if (/^\d{15}$/.test(ascii)) {
-        console.log("🧹 Stripped IMEI:", ascii);
-        rxBuffer = rxBuffer.slice(15);
-      } else break;
+    // Extract readable content
+    const ascii = buf.toString("ascii").replace(/\0/g, "");
+
+    // Example: extract temperature number (adjust after seeing final format)
+    const match = ascii.match(/(-?\d+(\.\d+)?)/);
+    if (match) {
+      const temperature = Number(match[1]) / 10; // if scaled
+      console.log("🌡️ TEMPERATURE:", temperature);
     }
-
-    if (rxBuffer.length < 7) return;
-
-    const byteCount = rxBuffer[2];
-    const frameLen = 3 + byteCount + 2;
-    if (rxBuffer.length < frameLen) return;
-
-    const frame = rxBuffer.slice(0, frameLen);
-    rxBuffer = rxBuffer.slice(frameLen);
-    waiting = false;
-
-    console.log("📥 TEMP RAW HEX:", frame.toString("hex"));
-
-    // CRC check
-    const crcRx = frame.readUInt16LE(frameLen - 2);
-    const crcCalc = crc.crc16modbus(frame.slice(0, frameLen - 2));
-    if (crcRx !== crcCalc) {
-      console.log("❌ CRC mismatch");
-      return;
-    }
-
-    const payload = frame.slice(3, 3 + byteCount);
-
-    const rawTemp = payload.readInt16BE(0);
-    const temperature = rawTemp / 10; // common scaling
-
-    console.log(`🌡️ LIVE TEMPERATURE: ${temperature} °C`);
-
-    await IotReading.create({
-      imei: IMEI,
-      data: {
-        slave: 1,
-        temperature,
-      },
-    });
   });
 
   socket.on("close", () => {
