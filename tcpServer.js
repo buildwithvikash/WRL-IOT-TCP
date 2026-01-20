@@ -1,41 +1,69 @@
-import express from "express";
-import bodyParser from "body-parser";
-import IotReading from "./models/IotReading.js";
+import net from "net";
+import dotenv from "dotenv";
 import { connectMongo } from "./mongo.js";
+import IotReading from "./models/IotReading.js";
 
-const app = express();
-const PORT = 3000;
-
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-
+dotenv.config();
 await connectMongo();
 
-app.post("/iot", async (req, res) => {
-  try {
-    const data = req.body;
+const PORT = process.env.PORT || 15000;
 
-    console.log("📥 HTTP RAW DATA:", data);
+const server = net.createServer((socket) => {
+  console.log("📡 Device connected:", socket.remoteAddress);
 
-    const imei = data.IMEI || data.imei;
-    if (!imei) {
-      return res.status(400).send("IMEI missing");
+  socket.on("data", async (buffer) => {
+    const raw = buffer.toString().trim();
+    console.log("📥 RAW DATA:", raw);
+
+    try {
+      // ✅ CASE 1: Registration packet (IMEI only)
+      if (/^\d{15}$/.test(raw)) {
+        console.log("🟢 REGISTRATION IMEI:", raw);
+
+        await IotReading.create({
+          imei: raw,
+          data: { REGISTER: true },
+        });
+
+        socket.write("OK\r\n");
+        return;
+      }
+
+      // ✅ CASE 2: Normal key=value packet
+      const parsed = {};
+      raw.split(";").forEach((pair) => {
+        if (!pair) return;
+        const [k, v] = pair.split("=");
+        if (k && v) parsed[k] = v;
+      });
+
+      if (!parsed.IMEI) {
+        console.log("❌ IMEI missing in data packet");
+        return;
+      }
+
+      console.log(`🟢 LIVE DATA | IMEI: ${parsed.IMEI}`, parsed);
+
+      await IotReading.create({
+        imei: parsed.IMEI,
+        data: parsed,
+      });
+
+      socket.write("OK\r\n");
+    } catch (err) {
+      console.error("🔥 Error handling data:", err.message);
     }
+  });
 
-    const saved = await IotReading.create({
-      imei,
-      data,
-    });
+  socket.on("close", () => {
+    console.log("🔌 Device disconnected");
+  });
 
-    console.log("🟢 LIVE HTTP DATA | IMEI:", imei, data);
-
-    res.send("OK");
-  } catch (err) {
-    console.error("❌ HTTP ERROR:", err);
-    res.status(500).send("ERROR");
-  }
+  socket.on("error", (err) => {
+    console.error("⚠️ Socket error:", err.message);
+  });
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 HTTP Server running on port ${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 TCP Server running on port ${PORT}`);
 });
