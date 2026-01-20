@@ -19,7 +19,10 @@ function buildModbusFrame(slave, func, start, qty) {
   buf.writeUInt16BE(qty, 4);
 
   const crc16 = crc.crc16modbus(buf);
-  return Buffer.concat([buf, Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff])]);
+  return Buffer.concat([
+    buf,
+    Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff]),
+  ]);
 }
 
 function parseFloatDCBA(buf, offset) {
@@ -46,80 +49,103 @@ const polls = [
     slave: 2,
     func: 0x03,
     start: 30001,
-    qty: 28, // 14 registers = 7 floats
+    qty: 28,
   },
 ];
 
-let rxBuffer = Buffer.alloc(0);
-let pollIndex = 0;
-let activePoll = null;
-let waitingResponse = false;
+// ---------------- TCP SERVER ----------------
+const server = net.createServer((socket) => {
+  console.log("🟢 Device connected:", socket.remoteAddress);
 
-const poll = () => {
-  if (waitingResponse) return;
+  let rxBuffer = Buffer.alloc(0);
+  let pollIndex = 0;
+  let activePoll = null;
+  let waitingResponse = false;
 
-  activePoll = polls[pollIndex];
-  pollIndex = (pollIndex + 1) % polls.length;
+  const poll = () => {
+    if (waitingResponse) return;
 
-  const frame = buildModbusFrame(activePoll.slave, activePoll.qty);
+    activePoll = polls[pollIndex];
+    pollIndex = (pollIndex + 1) % polls.length;
 
-  waitingResponse = true;
-  socket.write(frame);
-};
+    const frame = buildModbusFrame(
+      activePoll.slave,
+      activePoll.func,
+      activePoll.start,
+      activePoll.qty
+    );
 
-const pollTimer = setInterval(poll, 2000);
+    waitingResponse = true;
+    socket.write(frame);
+  };
 
-socket.on("data", async (data) => {
-  rxBuffer = Buffer.concat([rxBuffer, data]);
+  const pollTimer = setInterval(poll, 2000);
 
-  if (rxBuffer.length < 5) return;
+  socket.on("data", async (data) => {
+    rxBuffer = Buffer.concat([rxBuffer, data]);
 
-  const byteCount = rxBuffer[2];
-  const frameLength = 3 + byteCount + 2; // data + CRC
+    if (rxBuffer.length < 5) return;
 
-  if (rxBuffer.length < frameLength) return;
+    const byteCount = rxBuffer[2];
+    const frameLength = 3 + byteCount + 2;
 
-  const frame = rxBuffer.slice(0, frameLength);
-  rxBuffer = rxBuffer.slice(frameLength);
-  waitingResponse = false;
+    if (rxBuffer.length < frameLength) return;
 
-  const payload = frame.slice(3, 3 + byteCount);
+    const frame = rxBuffer.slice(0, frameLength);
+    rxBuffer = rxBuffer.slice(frameLength);
+    waitingResponse = false;
 
-  // 🌡️ TEMPERATURE (Slave 1)
-  if (activePoll.type === "temperature") {
-    let temperature = payload.readInt16BE(0);
-    temperature = temperature / 10; // scale
+    const payload = frame.slice(3, 3 + byteCount);
 
-    console.log(`🌡️ LIVE TEMP: ${temperature} °C`);
+    // 🌡️ TEMPERATURE
+    if (activePoll.type === "temperature") {
+      let temperature = payload.readInt16BE(0) / 10;
 
-    await IotReading.create({
-      imei: IMEI,
-      data: {
-        slave: 1,
-        temperature,
-      },
-    });
-  }
+      console.log(`🌡️ LIVE TEMP: ${temperature} °C`);
 
-  // ⚡ ENERGY BULK (Slave 2)
-  if (activePoll.type === "energyBulk") {
-    const data = {
-      energy: parseFloatDCBA(payload, 0),
-      power: parseFloatDCBA(payload, 8),
-      voltage: parseFloatDCBA(payload, 12),
-      current: parseFloatDCBA(payload, 16),
-      powerFactor: parseFloatDCBA(payload, 20),
-      frequency: parseFloatDCBA(payload, 24),
-    };
+      await IotReading.create({
+        imei: IMEI,
+        data: {
+          slave: 1,
+          temperature,
+        },
+      });
+    }
 
-    console.log("🟢 LIVE ENERGY DATA:", data);
+    // ⚡ ENERGY BULK
+    if (activePoll.type === "energyBulk") {
+      const energyData = {
+        energy: parseFloatDCBA(payload, 0),
+        power: parseFloatDCBA(payload, 8),
+        voltage: parseFloatDCBA(payload, 12),
+        current: parseFloatDCBA(payload, 16),
+        powerFactor: parseFloatDCBA(payload, 20),
+        frequency: parseFloatDCBA(payload, 24),
+      };
 
-    await IotReading.create({
-      imei: IMEI,
-      data: {
-        slave: 2,
-        ...data,
-      },
-    });
-  }
+      console.log("⚡ LIVE ENERGY DATA:", energyData);
+
+      await IotReading.create({
+        imei: IMEI,
+        data: {
+          slave: 2,
+          ...energyData,
+        },
+      });
+    }
+  });
+
+  socket.on("close", () => {
+    console.log("🔴 Device disconnected");
+    clearInterval(pollTimer);
+  });
+
+  socket.on("error", (err) => {
+    console.error("Socket error:", err.message);
+    clearInterval(pollTimer);
+  });
+});
+
+server.listen(PORT, () => {
+  console.log(`🚀 TCP Server listening on port ${PORT}`);
 });
