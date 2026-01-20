@@ -58,6 +58,7 @@ const server = net.createServer((socket) => {
   let waitingResponse = false;
 
   const poll = () => {
+    if (!socket || socket.destroyed) return;
     if (!socket.imei || waitingResponse) return;
 
     activePoll = pollList[pollIndex];
@@ -79,19 +80,35 @@ const server = net.createServer((socket) => {
   };
 
   socket.on("data", async (data) => {
-    // 🔍 RAW LOG (keep for now)
-    console.log("⬇ RAW:", data.toString("hex"), JSON.stringify(data.toString()));
+    // ---------- RAW DEBUG ----------
+    console.log(
+      "⬇ RAW:",
+      data.toString("hex"),
+      JSON.stringify(data.toString())
+    );
+
+    const ascii = data.toString();
+
+    // ---------- IGNORE HTTP PROBES ----------
+    if (ascii.startsWith("GET ") || ascii.startsWith("POST ")) {
+      console.warn("⚠️ HTTP probe ignored");
+      return;
+    }
+
+    // ---------- IGNORE SHORT BINARY PROBES ----------
+    if (data.length < 8 && !socket.imei) {
+      console.warn("⚠️ Binary probe ignored");
+      return;
+    }
 
     // ---------- IMEI REGISTRATION ----------
     if (!socket.imei) {
-      const msg = data.toString().trim();
-      const imeiMatch = msg.match(/\d{15}/);
-
+      const imeiMatch = ascii.match(/\d{15}/);
       if (imeiMatch) {
         socket.imei = imeiMatch[0];
         console.log("📱 IMEI REGISTERED:", socket.imei);
 
-        // 🔥 START POLLING ONLY AFTER IMEI
+        // Start polling ONLY after IMEI
         socket.pollTimer = setInterval(poll, 2000);
       }
       return;
