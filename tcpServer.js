@@ -18,7 +18,10 @@ function buildModbusFrame(slave, func, start, qty) {
   buf.writeUInt16BE(qty, 4);
 
   const crc16 = crc.crc16modbus(buf);
-  return Buffer.concat([buf, Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff])]);
+  return Buffer.concat([
+    buf,
+    Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff]),
+  ]);
 }
 
 function parseFloatCDAB(buf, offset) {
@@ -47,6 +50,7 @@ const server = net.createServer((socket) => {
   console.log("📡 Gateway connected:", socket.remoteAddress);
 
   socket.imei = null;
+  socket.pollTimer = null;
 
   let rxBuffer = Buffer.alloc(0);
   let pollIndex = 0;
@@ -74,20 +78,26 @@ const server = net.createServer((socket) => {
     pollIndex = (pollIndex + 1) % pollList.length;
   };
 
-  const pollTimer = setInterval(poll, 2000);
-
   socket.on("data", async (data) => {
-    // ----- IMEI REGISTRATION -----
+    // 🔍 RAW LOG (keep for now)
+    console.log("⬇ RAW:", data.toString("hex"), JSON.stringify(data.toString()));
+
+    // ---------- IMEI REGISTRATION ----------
     if (!socket.imei) {
       const msg = data.toString().trim();
-      if (/^\d{15}$/.test(msg)) {
-        socket.imei = msg;
+      const imeiMatch = msg.match(/\d{15}/);
+
+      if (imeiMatch) {
+        socket.imei = imeiMatch[0];
         console.log("📱 IMEI REGISTERED:", socket.imei);
+
+        // 🔥 START POLLING ONLY AFTER IMEI
+        socket.pollTimer = setInterval(poll, 2000);
       }
       return;
     }
 
-    // ----- MODBUS RESPONSE -----
+    // ---------- MODBUS RESPONSE ----------
     rxBuffer = Buffer.concat([rxBuffer, data]);
 
     if (rxBuffer.length < 7) return;
@@ -125,7 +135,7 @@ const server = net.createServer((socket) => {
   });
 
   socket.on("close", () => {
-    clearInterval(pollTimer);
+    if (socket.pollTimer) clearInterval(socket.pollTimer);
     console.log("🔌 Gateway disconnected:", socket.imei);
   });
 
