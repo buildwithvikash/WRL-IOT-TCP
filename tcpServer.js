@@ -8,7 +8,6 @@ dotenv.config();
 await connectMongo();
 
 const PORT = process.env.PORT || 15000;
-const IMEI = "865661071962420";
 
 // ---------------- MODBUS HELPERS ----------------
 function buildModbusFrame(slave, func, start, qty) {
@@ -19,10 +18,7 @@ function buildModbusFrame(slave, func, start, qty) {
   buf.writeUInt16BE(qty, 4);
 
   const crc16 = crc.crc16modbus(buf);
-  return Buffer.concat([
-    buf,
-    Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff]),
-  ]);
+  return Buffer.concat([buf, Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff])]);
 }
 
 function parseFloatCDAB(buf, offset) {
@@ -37,15 +33,7 @@ function parseFloatCDAB(buf, offset) {
 
 // ---------------- DEVICE MAP ----------------
 const pollList = [
-  // 🌡️ Temperature Indicator (Slave 1)
-  {
-    slave: 1,
-    name: "temperature",
-    addr: 44097,
-    type: "short",
-  },
-
-  // ⚡ Energy Meter (Slave 2)
+  { slave: 1, name: "temperature", addr: 44097, type: "short" },
   { slave: 2, name: "energy", addr: 30001, type: "float" },
   { slave: 2, name: "power", addr: 30015, type: "float" },
   { slave: 2, name: "voltage", addr: 30021, type: "float" },
@@ -58,11 +46,16 @@ const pollList = [
 const server = net.createServer((socket) => {
   console.log("📡 Gateway connected:", socket.remoteAddress);
 
+  socket.imei = null;
+
   let rxBuffer = Buffer.alloc(0);
   let pollIndex = 0;
   let activePoll = null;
+  let waitingResponse = false;
 
   const poll = () => {
+    if (!socket.imei || waitingResponse) return;
+
     activePoll = pollList[pollIndex];
 
     const qty = activePoll.type === "short" ? 1 : 2;
@@ -75,22 +68,37 @@ const server = net.createServer((socket) => {
       qty
     );
 
+    waitingResponse = true;
     socket.write(frame);
+
     pollIndex = (pollIndex + 1) % pollList.length;
   };
 
   const pollTimer = setInterval(poll, 2000);
 
   socket.on("data", async (data) => {
+    // ----- IMEI REGISTRATION -----
+    if (!socket.imei) {
+      const msg = data.toString().trim();
+      if (/^\d{15}$/.test(msg)) {
+        socket.imei = msg;
+        console.log("📱 IMEI REGISTERED:", socket.imei);
+      }
+      return;
+    }
+
+    // ----- MODBUS RESPONSE -----
     rxBuffer = Buffer.concat([rxBuffer, data]);
 
     if (rxBuffer.length < 7) return;
 
     const byteCount = rxBuffer[2];
-    if (rxBuffer.length < 3 + byteCount) return;
+    const frameLength = 3 + byteCount + 2;
+
+    if (rxBuffer.length < frameLength) return;
 
     const payload = rxBuffer.slice(3, 3 + byteCount);
-    rxBuffer = Buffer.alloc(0);
+    rxBuffer = rxBuffer.slice(frameLength);
 
     let value;
     if (activePoll.type === "short") {
@@ -99,13 +107,15 @@ const server = net.createServer((socket) => {
       value = parseFloatCDAB(payload, 0);
     }
 
+    waitingResponse = false;
+
     console.log(
-      `🟢 LIVE DATA | Slave ${activePoll.slave} | ${activePoll.name}:`,
+      `🟢 LIVE DATA | IMEI ${socket.imei} | Slave ${activePoll.slave} | ${activePoll.name}:`,
       value
     );
 
     await IotReading.create({
-      imei: IMEI,
+      imei: socket.imei,
       data: {
         slave: activePoll.slave,
         parameter: activePoll.name,
@@ -116,7 +126,7 @@ const server = net.createServer((socket) => {
 
   socket.on("close", () => {
     clearInterval(pollTimer);
-    console.log("🔌 Gateway disconnected");
+    console.log("🔌 Gateway disconnected:", socket.imei);
   });
 
   socket.on("error", (err) => {
