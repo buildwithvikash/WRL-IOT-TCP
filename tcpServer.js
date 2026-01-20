@@ -6,8 +6,7 @@ const server = net.createServer((socket) => {
   console.log("📡 UDC Gateway Connected:", socket.remoteAddress);
 
   socket.on("data", (buf) => {
-    console.log("📥 RAW ASCII:");
-    console.log(buf.toString());
+    console.log("📥 DATA:", buf.toString());
   });
 
   socket.on("close", () => console.log("🔌 Gateway disconnected"));
