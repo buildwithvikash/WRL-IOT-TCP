@@ -1,6 +1,5 @@
 import net from "net";
 import dotenv from "dotenv";
-import crc from "crc";
 import { connectMongo } from "./mongo.js";
 import IotReading from "./models/IotReading.js";
 
@@ -8,144 +7,67 @@ dotenv.config();
 await connectMongo();
 
 const PORT = process.env.PORT || 15000;
-const IMEI = "865661071962420";
 
-// ---------------- MODBUS HELPERS ----------------
-function buildModbusFrame(slave, func, start, qty) {
-  const buf = Buffer.alloc(6);
-  buf.writeUInt8(slave, 0);
-  buf.writeUInt8(func, 1);
-  buf.writeUInt16BE(start, 2);
-  buf.writeUInt16BE(qty, 4);
-
-  const crc16 = crc.crc16modbus(buf);
-  return Buffer.concat([
-    buf,
-    Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff]),
-  ]);
-}
-
-function parseFloatDCBA(buf, offset) {
-  const reordered = Buffer.from([
-    buf[offset + 3],
-    buf[offset + 2],
-    buf[offset + 1],
-    buf[offset + 0],
-  ]);
-  return reordered.readFloatBE(0);
-}
-
-// ---------------- POLL DEFINITIONS ----------------
-const polls = [
-  {
-    type: "temperature",
-    slave: 1,
-    func: 0x04,
-    start: 44097,
-    qty: 1,
-  },
-  {
-    type: "energyBulk",
-    slave: 2,
-    func: 0x03,
-    start: 30001,
-    qty: 28,
-  },
-];
-
-// ---------------- TCP SERVER ----------------
 const server = net.createServer((socket) => {
-  console.log("🟢 Device connected:", socket.remoteAddress);
+  console.log("📡 Device connected:", socket.remoteAddress);
 
-  let rxBuffer = Buffer.alloc(0);
-  let pollIndex = 0;
-  let activePoll = null;
-  let waitingResponse = false;
+  let bufferData = ""; // 🔴 IMPORTANT: TCP buffer
 
-  const poll = () => {
-    if (waitingResponse) return;
+  socket.on("data", async (chunk) => {
+    bufferData += chunk.toString();
 
-    activePoll = polls[pollIndex];
-    pollIndex = (pollIndex + 1) % polls.length;
-
-    const frame = buildModbusFrame(
-      activePoll.slave,
-      activePoll.func,
-      activePoll.start,
-      activePoll.qty
-    );
-
-    waitingResponse = true;
-    socket.write(frame);
-  };
-
-  const pollTimer = setInterval(poll, 2000);
-
-  socket.on("data", async (data) => {
-    rxBuffer = Buffer.concat([rxBuffer, data]);
-
-    if (rxBuffer.length < 5) return;
-
-    const byteCount = rxBuffer[2];
-    const frameLength = 3 + byteCount + 2;
-
-    if (rxBuffer.length < frameLength) return;
-
-    const frame = rxBuffer.slice(0, frameLength);
-    rxBuffer = rxBuffer.slice(frameLength);
-    waitingResponse = false;
-
-    const payload = frame.slice(3, 3 + byteCount);
-
-    // 🌡️ TEMPERATURE
-    if (activePoll.type === "temperature") {
-      let temperature = payload.readInt16BE(0) / 10;
-
-      console.log(`🌡️ LIVE TEMP: ${temperature} °C`);
-
-      await IotReading.create({
-        imei: IMEI,
-        data: {
-          slave: 1,
-          temperature,
-        },
-      });
+    // Wait until a full packet is received
+    if (!bufferData.includes("\n") && !bufferData.includes(";")) {
+      return;
     }
 
-    // ⚡ ENERGY BULK
-    if (activePoll.type === "energyBulk") {
-      const energyData = {
-        energy: parseFloatDCBA(payload, 0),
-        power: parseFloatDCBA(payload, 8),
-        voltage: parseFloatDCBA(payload, 12),
-        current: parseFloatDCBA(payload, 16),
-        powerFactor: parseFloatDCBA(payload, 20),
-        frequency: parseFloatDCBA(payload, 24),
-      };
+    const raw = bufferData.trim();
+    bufferData = ""; // clear buffer
 
-      console.log("⚡ LIVE ENERGY DATA:", energyData);
+    console.log("📥 RAW DATA:", raw);
 
-      await IotReading.create({
-        imei: IMEI,
-        data: {
-          slave: 2,
-          ...energyData,
-        },
-      });
+    /* -----------------------------
+       CASE 1: Registration packet
+       ----------------------------- */
+    if (/^\d{15}$/.test(raw)) {
+      console.log(`🟢 REGISTRATION IMEI: ${raw}`);
+      return;
     }
+
+    /* -----------------------------
+       CASE 2: Telemetry packet
+       ----------------------------- */
+    const parsed = {};
+    raw.split(";").forEach((pair) => {
+      if (!pair) return;
+      const [k, v] = pair.split("=");
+      if (k && v) parsed[k.trim()] = v.trim();
+    });
+
+    if (!parsed.IMEI) {
+      console.log("❌ IMEI missing in telemetry packet");
+      return;
+    }
+
+    console.log(`🟢 LIVE DATA | IMEI: ${parsed.IMEI}`, parsed);
+
+    await IotReading.create({
+      imei: parsed.IMEI,
+      data: parsed,
+    });
+
+    socket.write("OK\r\n"); // ACK to device
   });
 
   socket.on("close", () => {
-    console.log("🔴 Device disconnected");
-    clearInterval(pollTimer);
+    console.log("🔌 Device disconnected");
   });
 
   socket.on("error", (err) => {
-    console.error("Socket error:", err.message);
-    clearInterval(pollTimer);
+    console.error("⚠️ Socket error:", err.message);
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`🚀 TCP Server listening on port ${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 TCP Server running on port ${PORT}`);
 });
