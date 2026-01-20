@@ -6,67 +6,45 @@ import IotReading from "./models/IotReading.js";
 dotenv.config();
 await connectMongo();
 
-const PORT = process.env.PORT || 15000;
+const PORT = 15000;
 
 const server = net.createServer((socket) => {
   console.log("📡 Device connected:", socket.remoteAddress);
 
-  let bufferData = ""; // 🔴 IMPORTANT: TCP buffer
+  let buffer = Buffer.alloc(0);
+  let imeiCaptured = false;
 
   socket.on("data", async (chunk) => {
-    bufferData += chunk.toString();
+    console.log("📥 RAW HEX :", chunk.toString("hex"));
+    console.log("📥 RAW TXT :", chunk.toString());
 
-    // Wait until a full packet is received
-    if (!bufferData.includes("\n") && !bufferData.includes(";")) {
-      return;
-    }
+    buffer = Buffer.concat([buffer, chunk]);
 
-    const raw = bufferData.trim();
-    bufferData = ""; // clear buffer
+    if (imeiCaptured) return;
 
-    console.log("📥 RAW DATA:", raw);
+    const ascii = buffer.toString("ascii");
 
-    /* -----------------------------
-       CASE 1: Registration packet
-       ----------------------------- */
-    if (/^\d{15}$/.test(raw)) {
-      console.log(`🟢 REGISTRATION IMEI: ${raw}`);
+    // 🔑 Find first 15-digit IMEI
+    const match = ascii.match(/\d{15}/);
+
+    if (match) {
+      const imei = match[0];
+      imeiCaptured = true;
+
+      console.log("🟢 IMEI RECEIVED:", imei);
 
       await IotReading.create({
-        imei: raw,
+        imei,
         data: { type: "registration" },
       });
 
       socket.write("OK\r\n");
-      return;
     }
 
-    /* -----------------------------
-       CASE 2: Telemetry packet
-       ----------------------------- */
-    const parsed = {};
-    raw.split(";").forEach((pair) => {
-      if (!pair) return;
-      const [k, v] = pair.split("=");
-      if (k && v) parsed[k.trim()] = v.trim();
-    });
-
-    if (!parsed.IMEI) {
-      console.log("❌ IMEI missing in telemetry packet");
-      return;
+    // prevent buffer from growing forever
+    if (buffer.length > 1024) {
+      buffer = buffer.slice(-100);
     }
-
-    console.log(
-      `🟢 LIVE DATA | IMEI: ${parsed.IMEI}`,
-      parsed
-    );
-
-    await IotReading.create({
-      imei: parsed.IMEI,
-      data: parsed,
-    });
-
-    socket.write("OK\r\n"); // ACK to device
   });
 
   socket.on("close", () => {
@@ -79,5 +57,5 @@ const server = net.createServer((socket) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 TCP Server running on port ${PORT}`);
+  console.log(`🚀 Transparent TCP server listening on ${PORT}`);
 });
