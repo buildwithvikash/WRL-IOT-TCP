@@ -1,17 +1,125 @@
 import net from "net";
+import dotenv from "dotenv";
+import crc from "crc";
+import { connectMongo } from "./mongo.js";
+import IotReading from "./models/IotReading.js";
 
-const PORT = 15000;
+dotenv.config();
+await connectMongo();
 
-const server = net.createServer((socket) => {
-  console.log("📡 UDC Gateway Connected:", socket.remoteAddress);
+const PORT = process.env.PORT || 15000;
+const IMEI = "865661071962420";
 
-  socket.on("data", (buf) => {
-    console.log("📥 DATA:", buf.toString());
-  });
+// ---------------- MODBUS HELPERS ----------------
+function buildModbusFrame(slave, func, start, qty) {
+  const buf = Buffer.alloc(6);
+  buf.writeUInt8(slave, 0);
+  buf.writeUInt8(func, 1);
+  buf.writeUInt16BE(start, 2);
+  buf.writeUInt16BE(qty, 4);
 
-  socket.on("close", () => console.log("🔌 Gateway disconnected"));
-});
+  const crc16 = crc.crc16modbus(buf);
+  return Buffer.concat([buf, Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff])]);
+}
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 UDC TCP Server listening on ${PORT}`);
+function parseFloatDCBA(buf, offset) {
+  const reordered = Buffer.from([
+    buf[offset + 3],
+    buf[offset + 2],
+    buf[offset + 1],
+    buf[offset + 0],
+  ]);
+  return reordered.readFloatBE(0);
+}
+
+// ---------------- POLL DEFINITIONS ----------------
+const polls = [
+  {
+    type: "temperature",
+    slave: 1,
+    func: 0x04,
+    start: 44097,
+    qty: 1,
+  },
+  {
+    type: "energyBulk",
+    slave: 2,
+    func: 0x03,
+    start: 30001,
+    qty: 28, // 14 registers = 7 floats
+  },
+];
+
+let rxBuffer = Buffer.alloc(0);
+let pollIndex = 0;
+let activePoll = null;
+let waitingResponse = false;
+
+const poll = () => {
+  if (waitingResponse) return;
+
+  activePoll = polls[pollIndex];
+  pollIndex = (pollIndex + 1) % polls.length;
+
+  const frame = buildModbusFrame(activePoll.slave, activePoll.qty);
+
+  waitingResponse = true;
+  socket.write(frame);
+};
+
+const pollTimer = setInterval(poll, 2000);
+
+socket.on("data", async (data) => {
+  rxBuffer = Buffer.concat([rxBuffer, data]);
+
+  if (rxBuffer.length < 5) return;
+
+  const byteCount = rxBuffer[2];
+  const frameLength = 3 + byteCount + 2; // data + CRC
+
+  if (rxBuffer.length < frameLength) return;
+
+  const frame = rxBuffer.slice(0, frameLength);
+  rxBuffer = rxBuffer.slice(frameLength);
+  waitingResponse = false;
+
+  const payload = frame.slice(3, 3 + byteCount);
+
+  // 🌡️ TEMPERATURE (Slave 1)
+  if (activePoll.type === "temperature") {
+    let temperature = payload.readInt16BE(0);
+    temperature = temperature / 10; // scale
+
+    console.log(`🌡️ LIVE TEMP: ${temperature} °C`);
+
+    await IotReading.create({
+      imei: IMEI,
+      data: {
+        slave: 1,
+        temperature,
+      },
+    });
+  }
+
+  // ⚡ ENERGY BULK (Slave 2)
+  if (activePoll.type === "energyBulk") {
+    const data = {
+      energy: parseFloatDCBA(payload, 0),
+      power: parseFloatDCBA(payload, 8),
+      voltage: parseFloatDCBA(payload, 12),
+      current: parseFloatDCBA(payload, 16),
+      powerFactor: parseFloatDCBA(payload, 20),
+      frequency: parseFloatDCBA(payload, 24),
+    };
+
+    console.log("🟢 LIVE ENERGY DATA:", data);
+
+    await IotReading.create({
+      imei: IMEI,
+      data: {
+        slave: 2,
+        ...data,
+      },
+    });
+  }
 });
