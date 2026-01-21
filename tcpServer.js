@@ -1,176 +1,61 @@
 import net from "net";
 import dotenv from "dotenv";
-import crc from "crc";
 import { connectMongo } from "./mongo.js";
 import IotReading from "./models/IotReading.js";
 
 dotenv.config();
 await connectMongo();
 
-const PORT = process.env.PORT || 15000;
-
-/* ================= MODBUS HELPERS ================= */
-
-function buildModbusFrame(slave, func, start, qty) {
-  const buf = Buffer.alloc(6);
-  buf.writeUInt8(slave, 0);
-  buf.writeUInt8(func, 1);
-  buf.writeUInt16BE(start, 2);
-  buf.writeUInt16BE(qty, 4);
-
-  const crc16 = crc.crc16modbus(buf);
-  return Buffer.concat([
-    buf,
-    Buffer.from([crc16 & 0xff, (crc16 >> 8) & 0xff]),
-  ]);
-}
-
-// CDAB → Float (USR meters standard)
-function parseFloatCDAB(buf, offset) {
-  const reordered = Buffer.from([
-    buf[offset + 2],
-    buf[offset + 3],
-    buf[offset + 0],
-    buf[offset + 1],
-  ]);
-  return reordered.readFloatBE(0);
-}
-
-/* ================= DEVICE POLL MAP ================= */
-
-const pollList = [
-  { slave: 1, name: "temperature", addr: 44097, type: "short" },
-  { slave: 2, name: "energy", addr: 30001, type: "float" },
-  { slave: 2, name: "power", addr: 30015, type: "float" },
-  { slave: 2, name: "voltage", addr: 30021, type: "float" },
-  { slave: 2, name: "current", addr: 30023, type: "float" },
-  { slave: 2, name: "powerFactor", addr: 30025, type: "float" },
-  { slave: 2, name: "frequency", addr: 30027, type: "float" },
-];
-
-/* ================= TCP SERVER ================= */
+const PORT = 15000;
 
 const server = net.createServer((socket) => {
   console.log("📡 Device connected:", socket.remoteAddress);
 
-  socket.imei = null;
-  socket.pollTimer = null;
-  socket.rxBuffer = Buffer.alloc(0);
+  let buffer = Buffer.alloc(0);
+  let imeiCaptured = false;
 
-  let pollIndex = 0;
-  let activePoll = null;
-  let waitingResponse = false;
+  socket.on("data", async (chunk) => {
+    console.log("📥 RAW HEX :", chunk.toString("hex"));
+    console.log("📥 RAW TXT :", chunk.toString());
 
-  /* -------- POLLING FUNCTION -------- */
-  const poll = () => {
-    if (!socket || socket.destroyed) return;
-    if (!socket.imei || waitingResponse) return;
+    buffer = Buffer.concat([buffer, chunk]);
 
-    activePoll = pollList[pollIndex];
+    if (imeiCaptured) return;
 
-    const qty = activePoll.type === "short" ? 1 : 2;
-    const func = activePoll.addr >= 40000 ? 0x04 : 0x03;
+    const ascii = buffer.toString("ascii");
 
-    const frame = buildModbusFrame(
-      activePoll.slave,
-      func,
-      activePoll.addr - 1,
-      qty
-    );
+    // 🔑 Find first 15-digit IMEI
+    const match = ascii.match(/\d{15}/);
 
-    waitingResponse = true;
-    socket.write(frame);
+    if (match) {
+      const imei = match[0];
+      imeiCaptured = true;
 
-    pollIndex = (pollIndex + 1) % pollList.length;
-  };
+      console.log("🟢 IMEI RECEIVED:", imei);
 
-  /* -------- DATA HANDLER -------- */
-  socket.on("data", async (data) => {
-    console.log("⬇ RAW HEX:", data.toString("hex"));
+      await IotReading.create({
+        imei,
+        data: { type: "registration" },
+      });
 
-    /* --- DROP HTTP / TLS SCANNERS --- */
-    if (
-      data.toString().startsWith("GET ") ||
-      (data[0] === 0x16 && data[1] === 0x03)
-    ) {
-      socket.destroy();
-      return;
+      socket.write("OK\r\n");
     }
 
-    /* -------- IMEI LOGIN (USR-DR504) -------- */
-    if (!socket.imei) {
-      const msg = data.toString("utf8").trim();
-      console.log("📩 LOGIN:", msg);
-
-      const match = msg.match(/\d{15}/);
-      if (match) {
-        socket.imei = match[0];
-        console.log("📱 IMEI REGISTERED:", socket.imei);
-
-        socket.pollTimer = setInterval(poll, 2000);
-      }
-      return;
+    // prevent buffer from growing forever
+    if (buffer.length > 1024) {
+      buffer = buffer.slice(-100);
     }
-
-    /* -------- MODBUS RTU RESPONSE -------- */
-    socket.rxBuffer = Buffer.concat([socket.rxBuffer, data]);
-
-    if (socket.rxBuffer.length < 7) return;
-
-    const byteCount = socket.rxBuffer[2];
-    const frameLength = 3 + byteCount + 2;
-
-    if (socket.rxBuffer.length < frameLength) return;
-
-    const payload = socket.rxBuffer.slice(3, 3 + byteCount);
-    socket.rxBuffer = socket.rxBuffer.slice(frameLength);
-
-    let value;
-    try {
-      if (activePoll.type === "short") {
-        value = payload.readInt16BE(0);
-      } else {
-        value = parseFloatCDAB(payload, 0);
-      }
-    } catch (e) {
-      waitingResponse = false;
-      return;
-    }
-
-    waitingResponse = false;
-
-    console.log(
-      `🟢 LIVE | IMEI ${socket.imei} | Slave ${activePoll.slave} | ${activePoll.name}:`,
-      value
-    );
-
-    await IotReading.create({
-      imei: socket.imei,
-      data: {
-        slave: activePoll.slave,
-        parameter: activePoll.name,
-        value,
-      },
-      createdAt: new Date(),
-    });
   });
 
-  /* -------- SOCKET CLOSE -------- */
   socket.on("close", () => {
-    if (socket.pollTimer) clearInterval(socket.pollTimer);
-    console.log("🔌 Device disconnected:", socket.imei);
+    console.log("🔌 Device disconnected");
   });
 
-  /* -------- SOCKET ERROR -------- */
   socket.on("error", (err) => {
-    if (err.code !== "ECONNRESET") {
-      console.error("⚠️ Socket error:", err.message);
-    }
+    console.error("⚠️ Socket error:", err.message);
   });
 });
 
-/* ================= START SERVER ================= */
-
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 USR-DR504 TCP Server running on port ${PORT}`);
+  console.log(`🚀 Transparent TCP server listening on ${PORT}`);
 });
