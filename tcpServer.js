@@ -1,54 +1,33 @@
 import net from "net";
-import dotenv from "dotenv";
-import { connectMongo } from "./mongo.js";
-import IotReading from "./models/IotReading.js";
-
-dotenv.config();
-await connectMongo();
 
 const PORT = 15000;
 
 const server = net.createServer((socket) => {
-  console.log("📡 Device connected:", socket.remoteAddress);
+  console.log("📡 Gateway connected:", socket.remoteAddress);
 
   let buffer = Buffer.alloc(0);
-  let imeiCaptured = false;
 
-  socket.on("data", async (chunk) => {
-    console.log("📥 RAW HEX :", chunk.toString("hex"));
-    console.log("📥 RAW TXT :", chunk.toString());
-
+  socket.on("data", (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
 
-    if (imeiCaptured) return;
+    console.log("📥 RAW HEX :", chunk.toString("hex"));
+    console.log("📥 RAW TXT :", chunk.toString("ascii"));
 
+    // Extract IMEI if present
     const ascii = buffer.toString("ascii");
-
-    // 🔑 Find first 15-digit IMEI
     const match = ascii.match(/\d{15}/);
-
     if (match) {
-      const imei = match[0];
-      imeiCaptured = true;
-
-      console.log("🟢 IMEI RECEIVED:", imei);
-
-      await IotReading.create({
-        imei,
-        data: { type: "registration" },
-      });
-
-      socket.write("OK\r\n");
+      console.log("🟢 IMEI FOUND:", match[0]);
     }
 
-    // prevent buffer from growing forever
-    if (buffer.length > 1024) {
-      buffer = buffer.slice(-100);
+    // Prevent infinite buffer
+    if (buffer.length > 2048) {
+      buffer = buffer.slice(-256);
     }
   });
 
   socket.on("close", () => {
-    console.log("🔌 Device disconnected");
+    console.log("🔌 Gateway disconnected");
   });
 
   socket.on("error", (err) => {
