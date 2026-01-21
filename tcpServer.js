@@ -1,29 +1,37 @@
 import net from "net";
+import dotenv from "dotenv";
+import { connectMongo } from "./mongo.js";
+import IotReading from "./models/IotReading.js";
 
-const PORT = 15000;
+dotenv.config();
+await connectMongo();
+
+const PORT = process.env.PORT || 15000;
+const IMEI = "865661071962420";
 
 const server = net.createServer((socket) => {
   console.log("📡 Gateway connected:", socket.remoteAddress);
 
-  let buffer = Buffer.alloc(0);
+  socket.on("data", async (buffer) => {
+    // RAW formats
+    const hex = buffer.toString("hex");
+    const ascii = buffer.toString("utf8");
 
-  socket.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
+    console.log("📥 RAW HEX   :", hex);
+    console.log("📥 RAW ASCII:", ascii);
 
-    console.log("📥 RAW HEX :", chunk.toString("hex"));
-    console.log("📥 RAW TXT :", chunk.toString("ascii"));
+    // Store raw dump
+    await IotReading.create({
+      imei: IMEI,
+      data: {
+        rawHex: hex,
+        rawAscii: ascii,
+        length: buffer.length,
+      },
+    });
 
-    // Extract IMEI if present
-    const ascii = buffer.toString("ascii");
-    const match = ascii.match(/\d{15}/);
-    if (match) {
-      console.log("🟢 IMEI FOUND:", match[0]);
-    }
-
-    // Prevent infinite buffer
-    if (buffer.length > 2048) {
-      buffer = buffer.slice(-256);
-    }
+    // ACK (some gateways expect this)
+    socket.write("OK\r\n");
   });
 
   socket.on("close", () => {
@@ -36,5 +44,5 @@ const server = net.createServer((socket) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Transparent TCP server listening on ${PORT}`);
+  console.log(`🚀 RAW TCP Server listening on port ${PORT}`);
 });
